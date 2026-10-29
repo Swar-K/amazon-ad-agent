@@ -110,7 +110,7 @@ def write_review(project: Project, script: dict, entries: list[dict], cov_notes:
             "on_screen": ["- [ ] The disclosure appears as text on screen near the start (no voice-over line). Paste description.txt and title.txt; post pinned_comment.txt as a pinned comment."],
             "description_only": ["- [ ] Disclosure mode is description_only: nothing is said or shown inside the video. Paste description.txt (disclosure on its FIRST line) and title.txt, then post pinned_comment.txt as the first pinned comment.",
                                  "- [ ] Reminder: the FTC says a disclosure inside the video is clearer than one in the description box. If you ever want text on screen without a voice line, set disclosure: mode: on_screen in config.yaml."]}.get(disclosure_mode, []),
-          "- [ ] Your affiliate link is an Amazon link (amzn.to / amazon.* with your tag), and this channel is listed in your Associates account.",
+          "- [ ] Your affiliate link is an Amazon link (amzn.to / link.amazon / amazon.* with your tag), and this channel is listed in your Associates account.",
           "- [ ] YouTube's upload form asks about altered/synthetic content. Answer honestly for your AI voice.",
           "- [ ] This video differs meaningfully from your other uploads (different angle, your own footage/observations).",
           "- [ ] If the music file is yours to use, keep its licence info."]
