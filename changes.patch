@@ -1,0 +1,381 @@
+Only in ./.github/workflows: clean-artifacts.yml
+diff -ru '--exclude=__pycache__' '--exclude=.cache' ../amazon-ad-agent.orig/.github/workflows/make-video.yml ./.github/workflows/make-video.yml
+--- ../amazon-ad-agent.orig/.github/workflows/make-video.yml	2026-10-21 11:10:19.594391474 +0000
++++ ./.github/workflows/make-video.yml	2026-10-29 10:17:33.413567647 +0000
+@@ -99,12 +99,14 @@
+           sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+           pip install -r requirements.txt
+ 
+-      - name: Restore voice/asset cache (saves ElevenLabs credits on re-runs)
+-        uses: actions/cache@v4
++      - name: Restore voice/asset cache (saves ElevenLabs credits + Groq tokens on re-runs)
++        uses: actions/cache/restore@v4
+         with:
+-          path: projects/${{ env.ASIN }}/.cache
+-          key: adagent-${{ env.ASIN }}-${{ github.run_id }}
+-          restore-keys: adagent-${{ env.ASIN }}-
++          path: projects/*/.cache
++          key: adagent-all-${{ github.run_id }}
++          restore-keys: |
++            adagent-all-
++            adagent-${{ env.ASIN }}-
+ 
+       - name: Run
+         run: |
+@@ -119,7 +121,28 @@
+           if [ "$MODE" = "render" ] || [ "$MODE" = "all" ]; then
+             if [ "$PREVIEW" != "0" ] && [ -n "$PREVIEW" ]; then args+=(--max-seconds "$PREVIEW"); fi
+           fi
+-          python -m adagent "${args[@]}"
++          set -o pipefail
++          python -u -m adagent "${args[@]}" 2>&1 | tee run.log
++
++      - name: Show the result on the run summary page
++        if: always()
++        run: |
++          {
++            echo "### Video agent log (last 60 lines)"
++            echo '```'
++            tail -n 60 run.log 2>/dev/null || echo "(no log was written)"
++            echo '```'
++          } >> "$GITHUB_STEP_SUMMARY"
++          # put the real failure reason into the red Annotations box instead of only "exit code 1"
++          msg=$(grep -E "STOPPED|These lines break|Error|failed" run.log 2>/dev/null | tail -1 | cut -c1-900)
++          if [ -n "$msg" ]; then echo "::error title=Video agent::${msg}"; fi
++
++      - name: Save cache (also after a failed run, so paid-for vision results are kept)
++        if: always()
++        uses: actions/cache/save@v4
++        with:
++          path: projects/*/.cache
++          key: adagent-all-${{ github.run_id }}
+ 
+       - name: Upload results
+         if: always()
+@@ -131,11 +154,14 @@
+             projects/${{ env.ASIN }}/out/*.png
+             projects/${{ env.ASIN }}/out/*.txt
+             projects/${{ env.ASIN }}/out/*.md
+-          retention-days: 14
++            run.log
++          retention-days: 3          # short on purpose: the free plan has only 500 MB of artifact storage
+           if-no-files-found: ignore
+ 
+       - name: Save script + anti-duplication history
+-        if: success()
++        # always(): if render fails after the script was written (e.g. a policy flag), the script is still saved to the
++        # repo so you can edit projects/<ASIN>/script.md and run mode=render, instead of it being lost with the run.
++        if: always()
+         continue-on-error: true
+         run: |
+           mkdir -p /tmp/keep/scripts_archive
+diff -ru '--exclude=__pycache__' '--exclude=.cache' ../amazon-ad-agent.orig/adagent/assets.py ./adagent/assets.py
+--- ../amazon-ad-agent.orig/adagent/assets.py	2026-10-21 11:10:19.594530256 +0000
++++ ./adagent/assets.py	2026-10-27 08:35:03.788590918 +0000
+@@ -16,7 +16,7 @@
+ from PIL import Image, ImageOps
+ 
+ from .common import extract_json, log, sha1_file, video_info
+-from .llm import ask
++from .llm import DailyLimitError, ask
+ from .project import Project
+ 
+ IMG_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+@@ -128,8 +128,10 @@
+     for _ in range(2):
+         try:
+             txt = ask(cfg["llm"]["vision_model"], VISION_SYSTEM, VISION_PROMPT.format(what=what),
+-                      images=[img], max_tokens=1500, temperature=0.0)
++                      images=[img], max_tokens=350, temperature=0.0)
+             return extract_json(txt)
++        except DailyLimitError:
++            raise            # retrying cannot help; build_index saves its progress and stops cleanly
+         except Exception as e:
+             last = e
+     raise RuntimeError(f"Vision check failed: {last}")
+@@ -147,6 +149,13 @@
+     allow = {str(x).lower() for x in (project.facts.get("assets_allow") or [])}
+     files = sorted(p for p in project.assets_dir.glob("*") if p.suffix.lower() in IMG_EXT | VID_EXT)
+     entries: list[dict] = []
++
++    def save_progress() -> None:
++        """Write the cache after EVERY asset so a crash/rate-limit never throws away work already paid for."""
++        merged = dict(cache)
++        merged.update({e["hash"]: e for e in entries if e.get("hash")})
++        cache_file.write_text(json.dumps(list(merged.values()), indent=1))
++
+     for i, p in enumerate(files, 1):
+         h = sha1_file(p)
+         if h in cache and (cache[h].get("vision") or not vision):
+@@ -155,15 +164,25 @@
+         else:
+             kind = "image" if p.suffix.lower() in IMG_EXT else "clip"
+             e = {"id": f"A{i:02d}", "file": p.name, "hash": h, "kind": kind, "vision": vision}
+-            if kind == "image":
+-                img = load_image_bgr(p)
+-                e["width"], e["height"] = img.shape[1], img.shape[0]
+-                frames = [img]
+-                e["duration"] = 0.0
+-            else:
+-                vi = video_info(p)
+-                e.update(width=vi["width"], height=vi["height"], duration=vi["duration"], fps=vi["fps"])
+-                frames = sample_frames(p)
++            try:
++                if kind == "image":
++                    img = load_image_bgr(p)
++                    e["width"], e["height"] = img.shape[1], img.shape[0]
++                    frames = [img]
++                    e["duration"] = 0.0
++                else:
++                    vi = video_info(p)
++                    e.update(width=vi["width"], height=vi["height"], duration=vi["duration"], fps=vi["fps"])
++                    frames = sample_frames(p)
++            except Exception as err:  # noqa: BLE001  - a broken file must not stop the whole run
++                why = str(err).strip().splitlines()[-1][:140] if str(err).strip() else type(err).__name__
++                log(f"  SKIPPING {p.name}: the file is damaged or incomplete ({why}). "
++                    f"Re-export it and upload it again.")
++                e.update(width=0, height=0, duration=0.0, fps=0.0, usable=False,
++                         reason="file is damaged/incomplete (cannot be opened) - re-export and re-upload it",
++                         description=p.stem)
++                entries.append(e)
++                continue
+             if not frames:
+                 e.update(usable=False, reason="could not be read", description=p.stem)
+                 entries.append(e)
+@@ -171,7 +190,16 @@
+             e["haar_face"] = haar_has_face(frames)
+             if vision:
+                 log(f"  describing {p.name} ...")
+-                v = describe(cfg, frames, kind)
++                try:
++                    v = describe(cfg, frames, kind)
++                except DailyLimitError as err:
++                    save_progress()
++                    done = sum(1 for x in entries if x.get("vision"))
++                    raise SystemExit(
++                        f"STOPPED: every configured vision model has hit its daily Groq limit ({err}).\n"
++                        f"Progress is saved ({done} of {len(files)} assets described). Re-run later (the limit "
++                        f"resets on a rolling 24h window) and only the remaining assets will be described, "
++                        f"or add models under llm.vision_fallbacks in config.yaml, or run with --no-vision.")
+                 e["description"] = str(v.get("description", p.stem))
+                 e["shows_product"] = as_bool(v.get("shows_product"), True)
+                 e["llm_face"] = as_bool(v.get("has_human_face"), False)
+@@ -190,6 +218,7 @@
+         e["usable"] = not reasons
+         e["reason"] = "; ".join(reasons)
+         entries.append(e)
++        save_progress()
+     cache_file.write_text(json.dumps(entries, indent=1))
+     return entries
+ 
+diff -ru '--exclude=__pycache__' '--exclude=.cache' ../amazon-ad-agent.orig/adagent/cli.py ./adagent/cli.py
+--- ../amazon-ad-agent.orig/adagent/cli.py	2026-10-21 11:10:19.594570111 +0000
++++ ./adagent/cli.py	2026-10-22 09:07:57.269814200 +0000
+@@ -16,7 +16,7 @@
+ from .common import load_config, log
+ from .overlay import build_overlays
+ from .templates import apply_template, tpl_of
+-from .project import check_text, load_project, validate_facts
++from .project import POLICY_RULES, check_text, load_project, validate_facts
+ 
+ 
+ def _slug(s: str) -> str:
+@@ -135,9 +135,12 @@
+ 
+     bad = []
+     for s in segs:
+-        pol, _ = check_text(s["text"] + " " + s.get("onscreen", ""))
++        full = s["text"] + " " + s.get("onscreen", "")
++        pol, _ = check_text(full)
+         if pol:
+-            bad.append(f"  [{s['id']}] {', '.join(pol)}: {s['text'][:80]}")
++            hits = sorted({m.group(0) for pat, _w in POLICY_RULES for m in [re.search(pat, full, re.I)] if m})
++            bad.append(f"  [{s['id']}] {', '.join(pol)} -> matched: {', '.join(repr(h) for h in hits)}\n"
++                       f"      text: {s['text']}" + (f"\n      on-screen: {s['onscreen']}" if s.get("onscreen") else ""))
+     if bad:
+         raise SystemExit("These lines break Amazon Associates / content rules. Edit script.md and retry:\n" + "\n".join(bad))
+ 
+diff -ru '--exclude=__pycache__' '--exclude=.cache' ../amazon-ad-agent.orig/adagent/finish.py ./adagent/finish.py
+--- ../amazon-ad-agent.orig/adagent/finish.py	2026-10-21 11:10:19.594607021 +0000
++++ ./adagent/finish.py	2026-10-29 19:59:17.153769035 +0000
+@@ -110,7 +110,7 @@
+             "on_screen": ["- [ ] The disclosure appears as text on screen near the start (no voice-over line). Paste description.txt and title.txt; post pinned_comment.txt as a pinned comment."],
+             "description_only": ["- [ ] Disclosure mode is description_only: nothing is said or shown inside the video. Paste description.txt (disclosure on its FIRST line) and title.txt, then post pinned_comment.txt as the first pinned comment.",
+                                  "- [ ] Reminder: the FTC says a disclosure inside the video is clearer than one in the description box. If you ever want text on screen without a voice line, set disclosure: mode: on_screen in config.yaml."]}.get(disclosure_mode, []),
+-          "- [ ] Your affiliate link is an Amazon link (amzn.to / amazon.* with your tag), and this channel is listed in your Associates account.",
++          "- [ ] Your affiliate link is an Amazon link (amzn.to / link.amazon / amazon.* with your tag), and this channel is listed in your Associates account.",
+           "- [ ] YouTube's upload form asks about altered/synthetic content. Answer honestly for your AI voice.",
+           "- [ ] This video differs meaningfully from your other uploads (different angle, your own footage/observations).",
+           "- [ ] If the music file is yours to use, keep its licence info."]
+diff -ru '--exclude=__pycache__' '--exclude=.cache' ../amazon-ad-agent.orig/adagent/llm.py ./adagent/llm.py
+--- ../amazon-ad-agent.orig/adagent/llm.py	2026-10-21 11:10:19.594623210 +0000
++++ ./adagent/llm.py	2026-10-29 10:17:33.413184273 +0000
+@@ -25,6 +25,30 @@
+                "meta-llama/llama-4-maverick-17b-128e-instruct"]
+ _NOT_TEXT = ("whisper", "tts", "guard", "orpheus", "playai", "embed", "safeguard", "vision", "scout", "maverick", "-vl", "compound", "allam")
+ _substitutes: dict = {}   # (requested model, is_vision) -> model that actually works on this account
++_exhausted: set = set()   # models whose daily quota (TPD/RPD) ran out during this run
++
++
++_tpm_gap: dict = {}       # model -> minimum seconds between requests, learned from per-minute (TPM) 429 errors
++_last_call: dict = {}
++
++
++def _pace(model: str) -> None:
++    """Keep requests far enough apart that the per-minute token limit is not hit again and again."""
++    gap = _tpm_gap.get(model, 0.0)
++    if gap:
++        wait = _last_call.get(model, 0.0) + gap - time.time()
++        if wait > 0:
++            time.sleep(wait)
++    _last_call[model] = time.time()
++
++
++class DailyLimitError(RuntimeError):
++    """A model's DAILY quota is used up. Waiting a minute will not help, so callers fail over instead of retrying."""
++
++
++def _is_daily_limit(text: str) -> bool:
++    t = text.lower()
++    return any(k in t for k in ("tokens per day", "requests per day", "(tpd)", "(rpd)", "per day"))
+ 
+ 
+ @lru_cache(maxsize=1)
+@@ -113,7 +137,10 @@
+     _apply_reasoning(body, level)
+     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+     last, swapped = "", False
+-    for attempt in range(8):
++    attempt, tpm_waits = -1, 0
++    while attempt < 7:
++        attempt += 1
++        _pace(body["model"])
+         try:
+             r = requests.post(GROQ_URL, headers=headers, json=body, timeout=180)
+         except requests.RequestException as e:
+@@ -147,9 +174,47 @@
+         if r.status_code == 400 and "response_format" in body and "json" in r.text.lower():
+             body.pop("response_format")  # model without JSON mode: our parser copes with plain text
+             continue
++        if r.status_code in (413, 429) and "request too large" in r.text.lower():
++            # Not a "wait a minute" problem: this single request is bigger than the per-minute limit allows.
++            m = re.search(r"limit\s+(\d+),\s*requested\s+(\d+)", r.text, re.I)
++            if m and ("output tokens" in r.text.lower() or "max_tokens" in r.text.lower()):
++                limit, req = int(m.group(1)), int(m.group(2))
++                new = max(200, int(body["max_tokens"] * limit / max(req, 1) * 0.8))
++                if new < body["max_tokens"]:
++                    log(f"  Request exceeds {body['model']}'s output-tokens/minute limit ({limit}); "
++                        f"lowering max_tokens {body['max_tokens']} -> {new} and retrying.")
++                    body["max_tokens"] = new
++                    continue
++            raise RuntimeError(f"Groq says this single request is too large for {body['model']}'s per-minute "
++                               f"token limit, so waiting will not help. {last}")
++        if r.status_code == 429 and _is_daily_limit(r.text):
++            raise DailyLimitError(f"{body['model']}: daily quota used up ({r.text[:220]})")
+         if r.status_code == 429:
+-            wait = min(65.0, float(r.headers.get("retry-after", 8 + attempt * 6)))
+-            log(f"  Groq rate limit, waiting {wait:.0f}s ...")
++            low = r.text.lower()
++            hint = 0.0
++            mt = re.search(r"try again in\s+([\d.]+)\s*(ms|s|m)\b", r.text)
++            if mt:
++                hint = float(mt.group(1)) * {"ms": 0.001, "s": 1.0, "m": 60.0}[mt.group(2)]
++            try:
++                hint = max(hint, float(r.headers.get("retry-after", 0) or 0))
++            except ValueError:
++                pass
++            if "tokens per minute" in low or "(tpm)" in low:
++                # Per-minute token limit: space the following requests out, and don't count these waits
++                # against the normal retry budget (a long batch simply has to go at the allowed speed).
++                ml = re.search(r"limit\s+(\d+),\s*used\s+\d+,\s*requested\s+(\d+)", r.text, re.I)
++                if ml and int(ml.group(1)) > 0:
++                    gap = int(ml.group(2)) / int(ml.group(1)) * 60 * 1.1
++                    _tpm_gap[body["model"]] = max(_tpm_gap.get(body["model"], 0.0), gap)
++                tpm_waits += 1
++                if tpm_waits <= 40:
++                    attempt -= 1
++                wait = min(65.0, (hint or 10.0) + 1.0)
++                log(f"  Groq per-minute token limit, waiting {wait:.0f}s "
++                    f"(requests will now be spaced ~{_tpm_gap.get(body['model'], 0):.0f}s apart) ...")
++            else:
++                wait = min(65.0, hint or float(8 + attempt * 6))
++                log(f"  Groq rate limit, waiting {wait:.0f}s ...")
+             time.sleep(wait)
+             continue
+         if r.status_code == 413:
+@@ -186,8 +251,22 @@
+ 
+ def ask(model: str, system: str, user: str, images: list[np.ndarray] | None = None,
+         max_tokens: int = 8000, temperature: float = 0.8) -> str:
+-    fn = _ask_groq if _llm_cfg().get("provider", "groq") == "groq" else _ask_anthropic
+-    return fn(model, system, user, images, max_tokens, temperature)
++    if _llm_cfg().get("provider", "groq") != "groq":
++        return _ask_anthropic(model, system, user, images, max_tokens, temperature)
++    # Groq: when a model's DAILY quota is gone, move to the next model listed under llm.vision_fallbacks /
++    # llm.text_fallbacks in config.yaml (each model has its own daily quota).
++    fb = _llm_cfg().get("vision_fallbacks" if images else "text_fallbacks") or []
++    last = None
++    for m in [model] + [x for x in fb if x != model]:
++        if m in _exhausted:
++            continue
++        try:
++            return _ask_groq(m, system, user, images, max_tokens, temperature)
++        except DailyLimitError as e:
++            _exhausted.add(m)
++            last = e
++            log(f"  Daily limit reached for '{m}'. " + ("Trying the next fallback model ..." if m != ([model] + fb)[-1] else ""))
++    raise last or DailyLimitError(f"Every configured {'vision' if images else 'text'} model has hit its daily limit.")
+ 
+ 
+ if __name__ == "__main__":
+diff -ru '--exclude=__pycache__' '--exclude=.cache' ../amazon-ad-agent.orig/adagent/project.py ./adagent/project.py
+--- ../amazon-ad-agent.orig/adagent/project.py	2026-10-21 11:10:19.594671081 +0000
++++ ./adagent/project.py	2026-10-29 19:59:17.152859395 +0000
+@@ -11,7 +11,7 @@
+ 
+ ASIN_RE = re.compile(r"^[A-Z0-9][A-Z0-9_-]{2,39}$")   # a product ASIN, or the name of a comparison folder
+ AMAZON_LINK_RE = re.compile(
+-    r"^https://((www\.)?amazon\.[a-z.]{2,6}/|amzn\.(to|eu|asia)/|a\.co/)", re.I
++    r"^https://((www\.)?amazon\.[a-z.]{2,6}/|amzn\.(to|eu|asia)/|a\.co/|link\.amazon/)", re.I
+ )
+ 
+ 
+@@ -210,7 +210,7 @@
+     url = str(f.get("affiliate_url", ""))
+     if url and not AMAZON_LINK_RE.match(url):
+         errors.append(
+-            "facts.yaml: affiliate_url must be an Amazon link (amazon.*, amzn.to, amzn.eu or a.co). "
++            "facts.yaml: affiliate_url must be an Amazon link (amazon.*, amzn.to, amzn.eu, a.co or link.amazon). "
+             "Third-party link shorteners/cloakers are not allowed in Associates."
+         )
+     if url and "amazon." in url and "tag=" not in url:
+diff -ru '--exclude=__pycache__' '--exclude=.cache' ../amazon-ad-agent.orig/config.yaml ./config.yaml
+--- ../amazon-ad-agent.orig/config.yaml	2026-10-21 11:10:19.594886213 +0000
++++ ./config.yaml	2026-10-21 11:10:19.627860017 +0000
+@@ -97,6 +97,13 @@
+   provider: groq                                   # groq (free tier available) or anthropic (paid)
+   model: openai/gpt-oss-120b                       # script writing + fact check
+   vision_model: qwen/qwen3.8-27b                   # looks at your photos/clips (Qwen 3.8 is multimodal)
++  vision_fallbacks:                                # used in order when vision_model hits its DAILY limit (check names at console.groq.com/docs/models)
++    - qwen/qwen3.6-27b
++    - meta-llama/llama-4-scout-17b-16e-instruct
++    - meta-llama/llama-4-maverick-17b-128e-instruct
++  text_fallbacks:                                  # same idea for script writing
++    - openai/gpt-oss-20b
++    - qwen/qwen3-32b
+   groq_max_tokens: 6500                            # keeps requests inside free-tier per-minute limits
+   # For Anthropic instead: provider: anthropic, model: claude-sonnet-5-5, vision_model: claude-sonnet-5-5
+   # Check current Groq model names at console.groq.com/docs/models
+diff -ru '--exclude=__pycache__' '--exclude=.cache' ../amazon-ad-agent.orig/projects/_template/facts.yaml ./projects/_template/facts.yaml
+--- ../amazon-ad-agent.orig/projects/_template/facts.yaml	2026-10-21 11:10:19.595100211 +0000
++++ ./projects/_template/facts.yaml	2026-10-29 19:59:17.153399138 +0000
+@@ -15,7 +15,7 @@
+   - insulated water bottle
+   - best water bottle for gym
+ 
+-# Your Amazon affiliate link (SiteStripe short link amzn.to/xxxx, or an amazon.* link with your tag=).
++# Your Amazon affiliate link (SiteStripe short link amzn.to/xxxx or link.amazon/xxxx, or an amazon.* link with your tag=).
+ # Third-party link shorteners / cloakers are not allowed in Associates.
+ affiliate_url: "https://amzn.to/XXXXXXX"
+ 
+Only in ./tests: test_daily_limit_offline.py
