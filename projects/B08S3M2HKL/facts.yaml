@@ -32,8 +32,6 @@ manufacturer_claims:
 
 # Hard specs you can verify on the product / box / brand site.
 specs:
- - "Product: Alien Draft Seal"
-  - "ASIN: B08S3M2HKL"
   - "Brand: Alien"
   - "Manufacturer: Emson"
   - "Model number: 7688"
