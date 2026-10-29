@@ -1,0 +1,188 @@
+name: Make video
+
+on:
+  workflow_dispatch:
+    inputs:
+      asin:
+        description: "Project folder name under projects/ (a product ASIN, or a comparison folder)"
+        required: true
+      mode:
+        description: "script = write script.md | render = build the mp4 | all = both | scenes = plan AI clip scenes | preview = sample picture of all 5 templates"
+        type: choice
+        default: script
+        options: [script, render, all, scenes, preview]
+      length:
+        description: "auto = by video type (review ~5 min, comparison/list ~7.5 min, always under 9) | short = 1.5-4.8 min"
+        type: choice
+        default: auto
+        options: [auto, short]
+      template:
+        description: "Visual template (render/all): best = modern, one = clean minimal, two = bold vibrant, three = dark cinematic, four = modern glass"
+        type: choice
+        default: best
+        options: [best, one, two, three, four]
+      voice:
+        description: "Narration voice"
+        type: choice
+        default: edge_female
+        options:
+          - eleven_female
+          - eleven_female_2
+          - eleven_male
+          - eleven_male_2
+          - edge_female
+          - edge_female_2
+          - edge_male
+          - edge_male_2
+          - openai_female
+          - openai_male
+      angle:
+        description: "Video angle (blank = automatic rotation)"
+        type: choice
+        default: ""
+        options: ["", first_impressions, who_its_for, problem_solution, buyers_checklist, day_in_the_life, honest_pros_cons, gift_angle]
+      preview_seconds:
+        description: "Render only the first N seconds as a quick preview (0 = full video)"
+        default: "0"
+      force:
+        description: "Overwrite an existing script.md / ignore the daily limit"
+        type: boolean
+        default: false
+
+concurrency:
+  group: video-${{ inputs.asin }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      ASIN: ${{ inputs.asin }}
+      MODE: ${{ inputs.mode }}
+      LENGTH: ${{ inputs.length }}
+      TEMPLATE: ${{ inputs.template }}
+      VOICE: ${{ inputs.voice }}
+      ANGLE: ${{ inputs.angle }}
+      PREVIEW: ${{ inputs.preview_seconds }}
+      FORCE: ${{ inputs.force }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Validate ASIN
+        run: |
+          ASIN="$(printf '%s' "$ASIN" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"   # trim stray spaces
+          ASIN="${ASIN#projects/}"; ASIN="${ASIN%/}"                                              # allow "projects/NAME/"
+          echo "Project name received: [$ASIN]"
+          [[ "$ASIN" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{2,39}$ ]] || { echo "Project name [$ASIN] is not valid: use 3-40 letters, digits, - or _ (no spaces, slashes, dots or commas), exactly like the folder name under projects/"; exit 1; }
+          ASIN=$(echo "$ASIN" | tr a-z A-Z)
+          echo "ASIN=$ASIN" >> "$GITHUB_ENV"
+          [ -d "projects/$ASIN" ] || { echo "Folder projects/$ASIN not found. Check the spelling against the folders in your repo."; exit 1; }
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install ffmpeg, fonts, Python packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+          pip install -r requirements.txt
+
+      - name: Restore saved photo checks and voice lines (all projects)
+        uses: actions/cache/restore@v4
+        with:
+          path: projects/*/.cache
+          key: adagent-cache-${{ github.run_id }}
+          restore-keys: adagent-cache-
+
+      - name: Run
+        id: run
+        run: |
+          set -o pipefail
+          args=("$MODE" "$ASIN")
+          if [ "$MODE" = "render" ] || [ "$MODE" = "all" ]; then args+=(--voice "$VOICE"); fi
+          if [ "$MODE" = "render" ] || [ "$MODE" = "all" ]; then if [ -n "$TEMPLATE" ]; then args+=(--template "$TEMPLATE"); fi; fi
+          if [ "$MODE" = "script" ] || [ "$MODE" = "render" ] || [ "$MODE" = "all" ]; then if [ -n "$LENGTH" ]; then args+=(--length "$LENGTH"); fi; fi
+          if [ "$MODE" = "script" ] || [ "$MODE" = "all" ]; then
+            if [ -n "$ANGLE" ]; then args+=(--angle "$ANGLE"); fi
+          fi
+          if [ "$MODE" = "script" ] || [ "$MODE" = "all" ] || [ "$MODE" = "scenes" ]; then if [ "$FORCE" = "true" ]; then args+=(--force); fi; fi
+          if [ "$MODE" = "render" ] || [ "$MODE" = "all" ]; then
+            if [ "$PREVIEW" != "0" ] && [ -n "$PREVIEW" ]; then args+=(--max-seconds "$PREVIEW"); fi
+          fi
+          python -u -m adagent "${args[@]}" 2>&1 | tee run.log
+
+      - name: Show the result on the run summary page
+        if: always()
+        run: |
+          {
+            echo "### Video agent log (last 60 lines)"
+            echo '```'
+            tail -n 60 run.log 2>/dev/null || echo "(no log was written)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # put the real reason into the red Annotations box instead of only "exit code 1"
+          if [ "${{ steps.run.outcome }}" = "failure" ]; then
+            msg=$(grep -v '^[[:space:]]*$' run.log 2>/dev/null | tail -n 4 | tr '\n' ' ' | cut -c1-900)
+            if [ -n "$msg" ]; then echo "::error title=Video agent stopped::${msg}"; fi
+          fi
+
+      - name: Save photo checks and voice lines (also after a failed run)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: projects/*/.cache
+          key: adagent-cache-${{ github.run_id }}
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASIN }}-${{ inputs.mode }}-${{ github.run_number }}
+          path: |
+            projects/${{ env.ASIN }}/out/*.mp4
+            projects/${{ env.ASIN }}/out/*.png
+            projects/${{ env.ASIN }}/out/*.txt
+            projects/${{ env.ASIN }}/out/*.md
+            run.log
+          retention-days: 3          # short on purpose: the free plan has only 500 MB of artifact storage, download your video soon
+          if-no-files-found: ignore
+
+      - name: Save script + anti-duplication history
+        # always(): if the render fails after the script was written (for example a policy flag), the script is still saved to the
+        # repo, so you can edit projects/<ASIN>/script.md and run mode=render instead of it being lost with the run.
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p /tmp/keep/scripts_archive
+          rm -f /tmp/keep/script.md
+          rm -f /tmp/keep/scenes.md
+          if [ "$MODE" != "render" ] && [ "$MODE" != "scenes" ] && [ -f "projects/$ASIN/script.md" ]; then cp "projects/$ASIN/script.md" /tmp/keep/script.md; fi
+          if [ "$MODE" = "scenes" ] && [ -f "projects/$ASIN/scenes.md" ]; then cp "projects/$ASIN/scenes.md" /tmp/keep/scenes.md; fi
+          cp -r scripts_archive/. /tmp/keep/scripts_archive/ 2>/dev/null || true
+          git config user.name "adagent"
+          git config user.email "adagent@users.noreply.github.com"
+          for i in 1 2 3; do
+            git fetch -q origin main
+            git reset -q --hard origin/main
+            if [ -f /tmp/keep/script.md ]; then cp /tmp/keep/script.md "projects/$ASIN/script.md"; fi
+            if [ -f /tmp/keep/scenes.md ]; then cp /tmp/keep/scenes.md "projects/$ASIN/scenes.md"; fi
+            mkdir -p scripts_archive && cp -r /tmp/keep/scripts_archive/. scripts_archive/ 2>/dev/null || true
+            git add "projects/$ASIN/script.md" "projects/$ASIN/scenes.md" scripts_archive 2>/dev/null || true
+            if git diff --cached --quiet; then echo "nothing to save"; exit 0; fi
+            git commit -qm "script/history for $ASIN"
+            if git push -q origin HEAD:main; then echo "saved"; exit 0; fi
+            sleep 5
+          done
+          exit 1
