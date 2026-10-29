@@ -14,7 +14,6 @@ from . import scriptgen as S
 from . import timeline as T
 from . import tts as V
 from .common import load_config, log
-from .llm import DailyLimitError
 from .overlay import build_overlays
 from .templates import apply_template, tpl_of
 from .project import POLICY_RULES, check_text, load_project, validate_facts
@@ -289,14 +288,6 @@ def main(argv=None):
     sub.add_parser("eleven-voices", help="list voices available to your ElevenLabs key")
 
     args = p.parse_args(argv)
-    try:
-        _dispatch(args)
-    except DailyLimitError as e:
-        raise SystemExit(f"{e}\nWhat you can do: run again tomorrow, set another model in config.yaml (llm.model / llm.vision_model) "
-                         "from your Groq account's list, or upgrade the Groq tier. Anything already saved (photo checks, voice lines) is kept.")
-
-
-def _dispatch(args):
     {"index": cmd_index, "script": cmd_script, "render": cmd_render, "all": cmd_all, "scenes": cmd_scenes, "preview": cmd_preview,
      "voices": cmd_voices, "eleven-voices": cmd_eleven_voices}[args.cmd](args)
 

@@ -17,13 +17,6 @@ import requests
 
 from .common import load_config, log
 
-class DailyLimitError(RuntimeError):
-    """Groq's per-day quota for a model is used up. Waiting a minute will not help, so callers fail over or stop at once."""
-
-
-_exhausted: set = set()   # models whose daily quota ran out during this run (skipped on later calls)
-
-
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
 
@@ -32,6 +25,30 @@ PREF_VISION = ["qwen/qwen3.8-27b", "qwen/qwen3.6-27b", "meta-llama/llama-4-scout
                "meta-llama/llama-4-maverick-17b-128e-instruct"]
 _NOT_TEXT = ("whisper", "tts", "guard", "orpheus", "playai", "embed", "safeguard", "vision", "scout", "maverick", "-vl", "compound", "allam")
 _substitutes: dict = {}   # (requested model, is_vision) -> model that actually works on this account
+_exhausted: set = set()   # models whose daily quota (TPD/RPD) ran out during this run
+
+
+_tpm_gap: dict = {}       # model -> minimum seconds between requests, learned from per-minute (TPM) 429 errors
+_last_call: dict = {}
+
+
+def _pace(model: str) -> None:
+    """Keep requests far enough apart that the per-minute token limit is not hit again and again."""
+    gap = _tpm_gap.get(model, 0.0)
+    if gap:
+        wait = _last_call.get(model, 0.0) + gap - time.time()
+        if wait > 0:
+            time.sleep(wait)
+    _last_call[model] = time.time()
+
+
+class DailyLimitError(RuntimeError):
+    """A model's DAILY quota is used up. Waiting a minute will not help, so callers fail over instead of retrying."""
+
+
+def _is_daily_limit(text: str) -> bool:
+    t = text.lower()
+    return any(k in t for k in ("tokens per day", "requests per day", "(tpd)", "(rpd)", "per day"))
 
 
 @lru_cache(maxsize=1)
@@ -109,7 +126,7 @@ def _ask_groq(model, system, user, images, max_tokens, temperature) -> str:
     if vision:  # instructions go in the user turn: most reliable with image input
         content = [{"type": "text", "text": system + "\n\n" + user}]
         for im in images:
-            content.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + jpeg_b64(im, int(_llm_cfg().get("vision_max_side", 640)))}})
+            content.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + jpeg_b64(im, 1024)}})
         messages = [{"role": "user", "content": content}]
     else:
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -120,7 +137,10 @@ def _ask_groq(model, system, user, images, max_tokens, temperature) -> str:
     _apply_reasoning(body, level)
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     last, swapped = "", False
-    for attempt in range(8):
+    attempt, tpm_waits = -1, 0
+    while attempt < 7:
+        attempt += 1
+        _pace(body["model"])
         try:
             r = requests.post(GROQ_URL, headers=headers, json=body, timeout=180)
         except requests.RequestException as e:
@@ -167,14 +187,34 @@ def _ask_groq(model, system, user, images, max_tokens, temperature) -> str:
                     continue
             raise RuntimeError(f"Groq says this single request is too large for {body['model']}'s per-minute "
                                f"token limit, so waiting will not help. {last}")
-        if r.status_code == 429 and re.search(r"tokens per day|\(TPD\)|requests per day|\(RPD\)|per day", r.text, re.I):
-            m = re.search(r"Limit (\d+), Used (\d+), Requested (\d+)", r.text)
-            detail = f" ({int(m.group(2)):,} of {int(m.group(1)):,} used today)" if m else ""
-            raise DailyLimitError(f"Groq's daily limit for the model '{body['model']}' is used up{detail}. "
-                                  "Waiting a minute will not help: the quota refills gradually over about 24 hours.")
+        if r.status_code == 429 and _is_daily_limit(r.text):
+            raise DailyLimitError(f"{body['model']}: daily quota used up ({r.text[:220]})")
         if r.status_code == 429:
-            wait = min(65.0, float(r.headers.get("retry-after", 8 + attempt * 6)))
-            log(f"  Groq rate limit, waiting {wait:.0f}s ...")
+            low = r.text.lower()
+            hint = 0.0
+            mt = re.search(r"try again in\s+([\d.]+)\s*(ms|s|m)\b", r.text)
+            if mt:
+                hint = float(mt.group(1)) * {"ms": 0.001, "s": 1.0, "m": 60.0}[mt.group(2)]
+            try:
+                hint = max(hint, float(r.headers.get("retry-after", 0) or 0))
+            except ValueError:
+                pass
+            if "tokens per minute" in low or "(tpm)" in low:
+                # Per-minute token limit: space the following requests out, and don't count these waits
+                # against the normal retry budget (a long batch simply has to go at the allowed speed).
+                ml = re.search(r"limit\s+(\d+),\s*used\s+\d+,\s*requested\s+(\d+)", r.text, re.I)
+                if ml and int(ml.group(1)) > 0:
+                    gap = int(ml.group(2)) / int(ml.group(1)) * 60 * 1.1
+                    _tpm_gap[body["model"]] = max(_tpm_gap.get(body["model"], 0.0), gap)
+                tpm_waits += 1
+                if tpm_waits <= 40:
+                    attempt -= 1
+                wait = min(65.0, (hint or 10.0) + 1.0)
+                log(f"  Groq per-minute token limit, waiting {wait:.0f}s "
+                    f"(requests will now be spaced ~{_tpm_gap.get(body['model'], 0):.0f}s apart) ...")
+            else:
+                wait = min(65.0, hint or float(8 + attempt * 6))
+                log(f"  Groq rate limit, waiting {wait:.0f}s ...")
             time.sleep(wait)
             continue
         if r.status_code == 413:
@@ -213,12 +253,11 @@ def ask(model: str, system: str, user: str, images: list[np.ndarray] | None = No
         max_tokens: int = 8000, temperature: float = 0.8) -> str:
     if _llm_cfg().get("provider", "groq") != "groq":
         return _ask_anthropic(model, system, user, images, max_tokens, temperature)
-    # Groq: when a model's DAILY quota is gone, move on to the next model listed under llm.vision_fallbacks /
-    # llm.text_fallbacks in config.yaml (every model has its own daily quota).
-    kind = "vision" if images else "text"
-    chain = [model] + [x for x in (_llm_cfg().get(f"{kind}_fallbacks") or []) if x != model]
+    # Groq: when a model's DAILY quota is gone, move to the next model listed under llm.vision_fallbacks /
+    # llm.text_fallbacks in config.yaml (each model has its own daily quota).
+    fb = _llm_cfg().get("vision_fallbacks" if images else "text_fallbacks") or []
     last = None
-    for i, m in enumerate(chain):
+    for m in [model] + [x for x in fb if x != model]:
         if m in _exhausted:
             continue
         try:
@@ -226,17 +265,8 @@ def ask(model: str, system: str, user: str, images: list[np.ndarray] | None = No
         except DailyLimitError as e:
             _exhausted.add(m)
             last = e
-            nxt = next((x for x in chain[i + 1:] if x not in _exhausted), None)
-            log(f"  Daily limit reached for '{m}'." + (f" Trying '{nxt}' instead ..." if nxt else ""))
-        except RuntimeError as e:
-            if not any(x in _exhausted for x in chain[:i]):
-                raise                           # the first-choice model failed for another reason: report it as before
-            log(f"  Fallback model '{m}' could not be used ({str(e)[:140]}); trying the next one ...")
-            last = last or e
-    if len(chain) > 1:
-        raise DailyLimitError(f"Every configured {kind} model has hit its daily limit today ({', '.join(chain)}). "
-                              "Waiting a minute will not help: the quotas refill gradually over about 24 hours.")
-    raise last
+            log(f"  Daily limit reached for '{m}'. " + ("Trying the next fallback model ..." if m != ([model] + fb)[-1] else ""))
+    raise last or DailyLimitError(f"Every configured {'vision' if images else 'text'} model has hit its daily limit.")
 
 
 if __name__ == "__main__":

@@ -128,22 +128,17 @@ def describe(cfg: dict, frames: list[np.ndarray], kind: str) -> dict:
     for _ in range(2):
         try:
             txt = ask(cfg["llm"]["vision_model"], VISION_SYSTEM, VISION_PROMPT.format(what=what),
-                      images=[img], max_tokens=400, temperature=0.0)
+                      images=[img], max_tokens=350, temperature=0.0)
             return extract_json(txt)
         except DailyLimitError:
-            raise
+            raise            # retrying cannot help; build_index saves its progress and stops cleanly
         except Exception as e:
             last = e
     raise RuntimeError(f"Vision check failed: {last}")
 
 
 def build_index(project: Project, cfg: dict, vision: bool = True) -> list[dict]:
-    """Return a list of asset dicts (usable and unusable) and cache it. Progress is saved after every photo, so a stopped
-    run never has to re-check what was already checked."""
-    if vision and not cfg.get("llm", {}).get("vision_check", True):
-        log("  (AI photo check is turned off in config.yaml: llm.vision_check. Faces are only checked locally; "
-            "look through your photos yourself for faces, prices and Amazon page elements.)")
-        vision = False
+    """Return a list of asset dicts (usable and unusable) and cache it."""
     cache_file = project.cache_dir / "assets_index.json"
     cache = {}
     if cache_file.exists():
@@ -155,31 +150,39 @@ def build_index(project: Project, cfg: dict, vision: bool = True) -> list[dict]:
     files = sorted(p for p in project.assets_dir.glob("*") if p.suffix.lower() in IMG_EXT | VID_EXT)
     entries: list[dict] = []
 
-    def save() -> None:
+    def save_progress() -> None:
+        """Write the cache after EVERY asset so a crash/rate-limit never throws away work already paid for."""
         merged = dict(cache)
-        merged.update({x["hash"]: x for x in entries if "hash" in x})
+        merged.update({e["hash"]: e for e in entries if e.get("hash")})
         cache_file.write_text(json.dumps(list(merged.values()), indent=1))
 
-    n_new = 0
     for i, p in enumerate(files, 1):
         h = sha1_file(p)
-        fresh = False
         if h in cache and (cache[h].get("vision") or not vision):
             e = dict(cache[h])
             e["file"], e["id"] = p.name, f"A{i:02d}"
         else:
-            fresh = True
             kind = "image" if p.suffix.lower() in IMG_EXT else "clip"
             e = {"id": f"A{i:02d}", "file": p.name, "hash": h, "kind": kind, "vision": vision}
-            if kind == "image":
-                img = load_image_bgr(p)
-                e["width"], e["height"] = img.shape[1], img.shape[0]
-                frames = [img]
-                e["duration"] = 0.0
-            else:
-                vi = video_info(p)
-                e.update(width=vi["width"], height=vi["height"], duration=vi["duration"], fps=vi["fps"])
-                frames = sample_frames(p)
+            try:
+                if kind == "image":
+                    img = load_image_bgr(p)
+                    e["width"], e["height"] = img.shape[1], img.shape[0]
+                    frames = [img]
+                    e["duration"] = 0.0
+                else:
+                    vi = video_info(p)
+                    e.update(width=vi["width"], height=vi["height"], duration=vi["duration"], fps=vi["fps"])
+                    frames = sample_frames(p)
+            except Exception as err:  # noqa: BLE001  - a broken file must not stop the whole run
+                why = str(err).strip().splitlines()[-1][:140] if str(err).strip() else type(err).__name__
+                log(f"  SKIPPING {p.name}: the file is damaged or incomplete ({why}). "
+                    f"Re-export it and upload it again.")
+                e.update(width=0, height=0, duration=0.0, fps=0.0, usable=False,
+                         reason="file is damaged/incomplete (cannot be opened) - re-export and re-upload it",
+                         description=p.stem)
+                entries.append(e)
+                continue
             if not frames:
                 e.update(usable=False, reason="could not be read", description=p.stem)
                 entries.append(e)
@@ -190,14 +193,13 @@ def build_index(project: Project, cfg: dict, vision: bool = True) -> list[dict]:
                 try:
                     v = describe(cfg, frames, kind)
                 except DailyLimitError as err:
-                    save()
+                    save_progress()
+                    done = sum(1 for x in entries if x.get("vision"))
                     raise SystemExit(
-                        f"{err}\n"
-                        f"Your progress is saved: {len(entries)} of {len(files)} files in projects/{project.asin}/assets were already checked "
-                        "and will not be checked again.\n"
-                        "What you can do: (1) run again tomorrow, (2) add models under llm.vision_fallbacks in config.yaml (names from "
-                        "your Groq account's model list), (3) turn the AI photo check off with  llm: vision_check: false  in config.yaml "
-                        "(then check your own photos for faces and Amazon page elements), or (4) upgrade the Groq tier.")
+                        f"STOPPED: every configured vision model has hit its daily Groq limit ({err}).\n"
+                        f"Progress is saved ({done} of {len(files)} assets described). Re-run later (the limit "
+                        f"resets on a rolling 24h window) and only the remaining assets will be described, "
+                        f"or add models under llm.vision_fallbacks in config.yaml, or run with --no-vision.")
                 e["description"] = str(v.get("description", p.stem))
                 e["shows_product"] = as_bool(v.get("shows_product"), True)
                 e["llm_face"] = as_bool(v.get("has_human_face"), False)
@@ -216,10 +218,8 @@ def build_index(project: Project, cfg: dict, vision: bool = True) -> list[dict]:
         e["usable"] = not reasons
         e["reason"] = "; ".join(reasons)
         entries.append(e)
-        if fresh:
-            n_new += 1
-            save()
-    save()
+        save_progress()
+    cache_file.write_text(json.dumps(entries, indent=1))
     return entries
 
 
